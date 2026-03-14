@@ -9,7 +9,7 @@ This feature adds tmux control mode (`tmux -CC`) integration to Alacritty, allow
 Branch: `feature/tmux-cc-support`
 Remote: https://github.com/evilsquid888/alacritty
 
-**Status: Tested and working.** The `--tmux` flag opens a window, renders a shell prompt with colors, accepts keyboard input, and executes commands. Verified on X11 with tmux 3.4.
+**Status: Work in progress — more testing and debugging needed.** Basic functionality (window opens, shell prompt renders, some input works) has been verified, but the feature does not work exactly right yet. Further investigation and fixes are required before it is production-ready.
 
 ---
 
