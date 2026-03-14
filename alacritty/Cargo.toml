@@ -53,6 +53,7 @@ clap_complete = "4.2.3"
 
 [target.'cfg(not(windows))'.dependencies]
 xdg = "3.0.0"
+rustix-openpty = "0.2.0"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 png = { version = "0.17.5", default-features = false, optional = true }

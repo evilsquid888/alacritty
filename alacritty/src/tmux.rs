@@ -4,8 +4,9 @@
 //! between tmux panes and Alacritty windows.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use log::{debug, error, info, warn};
@@ -106,18 +107,34 @@ fn run_controller(
     cmd_tx: Sender<TmuxPtyCmd>,
     cmd_rx: Receiver<TmuxPtyCmd>,
 ) -> io::Result<()> {
-    // Spawn tmux in control mode.
+    // Spawn tmux in control mode inside a real PTY.
+    //
+    // tmux requires a controlling terminal (it calls tcgetattr on stdin).
+    // We create a pseudo-terminal pair and run tmux on the slave side,
+    // keeping the master side for reading/writing the control protocol.
     info!("Starting tmux control mode session: {session_name}");
+
+    let pty = rustix_openpty::openpty(None, None)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty failed: {e}")))?;
+    let master_fd = pty.controller;
+    let slave_fd = pty.user;
+
+    let slave_for_stdin = slave_fd.try_clone()?;
+    let slave_for_stdout = slave_fd.try_clone()?;
+    let slave_for_stderr = slave_fd;
+
     let mut child = Command::new("tmux")
         .args(["-CC", "new-session", "-A", "-s", session_name])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdin(slave_for_stdin)
+        .stdout(slave_for_stdout)
+        .stderr(slave_for_stderr)
         .spawn()?;
 
-    let tmux_stdout = child.stdout.take().unwrap();
-    let mut tmux_stdin = child.stdin.take().unwrap();
-    let mut reader = BufReader::new(tmux_stdout);
+    // Use the master fd to read/write the tmux control protocol.
+    let master_file = File::from(master_fd);
+    let master_write = master_file.try_clone()?;
+    let mut tmux_stdin = master_write;
+    let mut reader = BufReader::new(master_file);
 
     // Skip the initial DCS escape if present.
     skip_dcs_header(&mut reader)?;
