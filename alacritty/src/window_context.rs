@@ -257,6 +257,151 @@ impl WindowContext {
         })
     }
 
+    /// Create a new terminal window context backed by a tmux virtual PTY.
+    ///
+    /// This is the tmux equivalent of [`Self::new`] — instead of spawning a
+    /// shell it uses the provided [`TmuxPty`] which is connected to the
+    /// tmux controller via a socketpair.
+    #[cfg(unix)]
+    fn new_with_tmux_pty(
+        display: Display,
+        config: Rc<UiConfig>,
+        options: WindowOptions,
+        proxy: EventLoopProxy<Event>,
+        pty: alacritty_terminal::tmux::TmuxPty,
+    ) -> Result<Self, Box<dyn Error>> {
+        let preserve_title = options.window_identity.title.is_some();
+
+        info!(
+            "tmux PTY dimensions: {:?} x {:?}",
+            display.size_info.screen_lines(),
+            display.size_info.columns()
+        );
+
+        let event_proxy = EventProxy::new(proxy, display.window.id());
+
+        let terminal = Term::new(config.term_options(), &display.size_info, event_proxy.clone());
+        let terminal = Arc::new(FairMutex::new(terminal));
+
+        // Use dummy values for master_fd and shell_pid in tmux mode.
+        let master_fd = -1;
+        let shell_pid = 0;
+
+        let event_loop = PtyEventLoop::new(
+            Arc::clone(&terminal),
+            event_proxy.clone(),
+            pty,
+            false, // drain_on_exit
+            config.debug.ref_test,
+        )?;
+
+        let loop_tx = event_loop.channel();
+        let _io_thread = event_loop.spawn();
+
+        if config.cursor.style().blinking {
+            event_proxy.send_event(TerminalEvent::CursorBlinkingChange.into());
+        }
+
+        Ok(WindowContext {
+            preserve_title,
+            terminal,
+            display,
+            master_fd,
+            shell_pid,
+            config,
+            notifier: Notifier(loop_tx),
+            cursor_blink_timed_out: Default::default(),
+            prev_bell_cmd: Default::default(),
+            inline_search_state: Default::default(),
+            message_buffer: Default::default(),
+            window_config: Default::default(),
+            search_state: Default::default(),
+            event_queue: Default::default(),
+            modifiers: Default::default(),
+            occluded: Default::default(),
+            mouse: Default::default(),
+            touch: Default::default(),
+            dirty: Default::default(),
+        })
+    }
+
+    /// Create the initial window using a tmux virtual PTY.
+    #[cfg(unix)]
+    pub fn initial_with_tmux_pty(
+        event_loop: &ActiveEventLoop,
+        proxy: EventLoopProxy<Event>,
+        config: Rc<UiConfig>,
+        mut options: WindowOptions,
+        pty: alacritty_terminal::tmux::TmuxPty,
+    ) -> Result<Self, Box<dyn Error>> {
+        let raw_display_handle = event_loop.display_handle().unwrap().as_raw();
+
+        let mut identity = config.window.identity.clone();
+        options.window_identity.override_identity_config(&mut identity);
+
+        let raw_window_handle = None;
+
+        let gl_display = renderer::platform::create_gl_display(
+            raw_display_handle,
+            raw_window_handle,
+            config.debug.prefer_egl,
+        )?;
+        let gl_config = renderer::platform::pick_gl_config(&gl_display, raw_window_handle)?;
+
+        let window = Window::new(
+            event_loop,
+            &config,
+            &identity,
+            &mut options,
+            #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
+            gl_config.x11_visual(),
+        )?;
+
+        let gl_context =
+            renderer::platform::create_gl_context(&gl_display, &gl_config, raw_window_handle)?;
+
+        let display = Display::new(window, gl_context, &config, false)?;
+
+        Self::new_with_tmux_pty(display, config, options, proxy, pty)
+    }
+
+    /// Create an additional window using a tmux virtual PTY.
+    #[cfg(unix)]
+    pub fn with_tmux_pty(
+        gl_config: &GlutinConfig,
+        event_loop: &ActiveEventLoop,
+        proxy: EventLoopProxy<Event>,
+        config: Rc<UiConfig>,
+        mut options: WindowOptions,
+        config_overrides: ParsedOptions,
+        pty: alacritty_terminal::tmux::TmuxPty,
+    ) -> Result<Self, Box<dyn Error>> {
+        let gl_display = gl_config.display();
+
+        let mut identity = config.window.identity.clone();
+        options.window_identity.override_identity_config(&mut identity);
+
+        let window = Window::new(
+            event_loop,
+            &config,
+            &identity,
+            &mut options,
+            #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
+            gl_config.x11_visual(),
+        )?;
+
+        let raw_window_handle = window.raw_window_handle();
+        let gl_context =
+            renderer::platform::create_gl_context(&gl_display, gl_config, Some(raw_window_handle))?;
+
+        let display = Display::new(window, gl_context, &config, false)?;
+
+        let mut window_context =
+            Self::new_with_tmux_pty(display, config, options, proxy, pty)?;
+        window_context.window_config = config_overrides;
+        Ok(window_context)
+    }
+
     /// Update the terminal window to the latest config.
     pub fn update_config(&mut self, new_config: Rc<UiConfig>) {
         let old_config = mem::replace(&mut self.config, new_config);

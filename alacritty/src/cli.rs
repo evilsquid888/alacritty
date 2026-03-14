@@ -66,6 +66,14 @@ pub struct Options {
     #[clap(long)]
     pub daemon: bool,
 
+    /// Start in tmux control mode, attaching to or creating the named session.
+    ///
+    /// When set, Alacritty spawns `tmux -CC` and maps each tmux window to a
+    /// native Alacritty window. The session persists after Alacritty exits.
+    #[cfg(unix)]
+    #[clap(long, value_name = "SESSION")]
+    pub tmux: Option<String>,
+
     /// CLI options for config overrides.
     #[clap(skip)]
     pub config_options: ParsedOptions,

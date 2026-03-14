@@ -98,6 +98,8 @@ pub struct Processor {
     global_ipc_options: ParsedOptions,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    #[cfg(unix)]
+    tmux_session: Option<crate::tmux::TmuxSession>,
 }
 
 impl Processor {
@@ -140,6 +142,8 @@ impl Processor {
             windows: Default::default(),
             #[cfg(unix)]
             global_ipc_options: Default::default(),
+            #[cfg(unix)]
+            tmux_session: None,
             config_monitor,
         }
     }
@@ -194,6 +198,141 @@ impl Processor {
         Ok(())
     }
 
+    /// Create a new terminal window backed by a tmux virtual PTY.
+    #[cfg(unix)]
+    pub fn create_tmux_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        pty: alacritty_terminal::tmux::TmuxPty,
+        title: String,
+    ) -> Result<(), Box<dyn Error>> {
+        for window_context in self.windows.values_mut() {
+            window_context.display.make_not_current();
+        }
+
+        let gl_config = self.gl_config.as_ref().unwrap();
+        let mut options = WindowOptions::default();
+        options.window_identity.title = Some(title);
+
+        let mut config_overrides = options.config_overrides();
+        let config = config_overrides.override_config_rc(self.config.clone());
+
+        let window_context = WindowContext::with_tmux_pty(
+            gl_config,
+            event_loop,
+            self.proxy.clone(),
+            config,
+            options,
+            config_overrides,
+            pty,
+        )?;
+
+        self.windows.insert(window_context.id(), window_context);
+        Ok(())
+    }
+
+    /// Handle a tmux control mode event.
+    #[cfg(unix)]
+    fn handle_tmux_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        tmux_event: crate::tmux::TmuxEvent,
+    ) {
+        use crate::tmux::TmuxEvent;
+        match tmux_event {
+            TmuxEvent::PaneReady { pane_id: _, window_id, title } => {
+                // Get the next TmuxPty from the session.
+                if let Some(ref session) = self.tmux_session {
+                    if let Some((pty, _title)) = session.try_recv_pty() {
+                        // Create a window for this pane.
+                        if self.gl_config.is_none() {
+                            // First window — initialize GL.
+                            let proxy = self.proxy.clone();
+                            let mut options = WindowOptions::default();
+                            options.window_identity.title = Some(title.clone());
+
+                            match WindowContext::initial_with_tmux_pty(
+                                event_loop,
+                                proxy,
+                                self.config.clone(),
+                                options,
+                                pty,
+                            ) {
+                                Ok(window_context) => {
+                                    self.gl_config =
+                                        Some(window_context.display.gl_context().config());
+                                    let wid = window_context.id();
+                                    self.windows.insert(wid, window_context);
+                                    if let Some(ref mut session) = self.tmux_session {
+                                        session.register_window(window_id, wid);
+                                    }
+                                },
+                                Err(err) => {
+                                    error!("Failed to create initial tmux window: {err}");
+                                },
+                            }
+                        } else {
+                            match self.create_tmux_window(event_loop, pty, title.clone()) {
+                                Ok(()) => {
+                                    // Find the window we just created and register it.
+                                    if let Some((&wid, _)) = self.windows.iter().last() {
+                                        if let Some(ref mut session) = self.tmux_session {
+                                            session.register_window(window_id, wid);
+                                        }
+                                    }
+                                },
+                                Err(err) => {
+                                    error!("Failed to create tmux window: {err}");
+                                },
+                            }
+                        }
+                    }
+                }
+            },
+            TmuxEvent::WindowClosed { window_id } => {
+                if let Some(ref session) = self.tmux_session {
+                    if let Some(alacritty_wid) = session.get_alacritty_window(&window_id) {
+                        if let Entry::Occupied(entry) = self.windows.entry(alacritty_wid) {
+                            let wc = entry.remove();
+                            self.scheduler.unschedule_window(wc.id());
+                        }
+                    }
+                }
+
+                if self.windows.is_empty() {
+                    event_loop.exit();
+                }
+            },
+            TmuxEvent::WindowRenamed { window_id, name } => {
+                if let Some(ref session) = self.tmux_session {
+                    if let Some(alacritty_wid) = session.get_alacritty_window(&window_id) {
+                        if let Some(wc) = self.windows.get_mut(&alacritty_wid) {
+                            wc.display.window.set_title(name);
+                        }
+                    }
+                }
+            },
+            TmuxEvent::SessionExit => {
+                info!("tmux session exited, closing all windows");
+                event_loop.exit();
+            },
+        }
+    }
+
+    /// Start a tmux control mode session.
+    #[cfg(unix)]
+    pub fn start_tmux_session(&mut self, session_name: String) {
+        match crate::tmux::TmuxSession::start(session_name, self.proxy.clone()) {
+            Ok(session) => {
+                info!("tmux session started");
+                self.tmux_session = Some(session);
+            },
+            Err(err) => {
+                error!("Failed to start tmux session: {err}");
+            },
+        }
+    }
+
     /// Run the event loop.
     ///
     /// The result is exit code generate from the loop.
@@ -232,6 +371,22 @@ impl ApplicationHandler<Event> for Processor {
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause != StartCause::Init || self.cli_options.daemon {
+            return;
+        }
+
+        // In tmux mode, start the tmux session instead of creating a normal window.
+        // The tmux controller thread will send TmuxEvent::PaneReady events
+        // which create windows asynchronously.
+        #[cfg(unix)]
+        if let Some(ref session_name) = self.cli_options.tmux {
+            let name = if session_name.is_empty() {
+                "alacritty".to_string()
+            } else {
+                session_name.clone()
+            };
+            self.initial_window_options.take();
+            self.start_tmux_session(name);
+            info!("Initialisation complete (tmux mode)");
             return;
         }
 
@@ -388,6 +543,11 @@ impl ApplicationHandler<Event> for Processor {
                 } else if let Err(err) = self.create_window(event_loop, options) {
                     error!("Could not open window: {err:?}");
                 }
+            },
+            // Handle tmux control mode events.
+            #[cfg(unix)]
+            (EventType::TmuxEvent(tmux_event), _) => {
+                self.handle_tmux_event(event_loop, tmux_event);
             },
             // Shutdown all windows.
             #[cfg(unix)]
@@ -550,6 +710,9 @@ pub enum EventType {
     IpcConfig(IpcConfig),
     #[cfg(unix)]
     IpcGetConfig(Arc<UnixStream>),
+    /// tmux control mode event.
+    #[cfg(unix)]
+    TmuxEvent(crate::tmux::TmuxEvent),
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
@@ -1930,6 +2093,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 },
                 #[cfg(unix)]
                 EventType::IpcConfig(_) | EventType::IpcGetConfig(..) | EventType::Shutdown => (),
+                #[cfg(unix)]
+                EventType::TmuxEvent(_) => (),
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)

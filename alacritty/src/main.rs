@@ -46,6 +46,8 @@ mod polling;
 mod renderer;
 mod scheduler;
 mod string;
+#[cfg(unix)]
+mod tmux;
 mod window_context;
 
 mod gl {

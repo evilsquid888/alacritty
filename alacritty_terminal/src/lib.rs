@@ -12,6 +12,8 @@ pub mod selection;
 pub mod sync;
 pub mod term;
 pub mod thread;
+#[cfg(unix)]
+pub mod tmux;
 pub mod tty;
 pub mod vi_mode;
 
