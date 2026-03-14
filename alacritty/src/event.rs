@@ -100,6 +100,8 @@ pub struct Processor {
     config: Rc<UiConfig>,
     #[cfg(unix)]
     tmux_session: Option<crate::tmux::TmuxSession>,
+    #[cfg(unix)]
+    inband_tmux: Option<crate::tmux_inband::InBandTmuxState>,
 }
 
 impl Processor {
@@ -144,6 +146,8 @@ impl Processor {
             global_ipc_options: Default::default(),
             #[cfg(unix)]
             tmux_session: None,
+            #[cfg(unix)]
+            inband_tmux: None,
             config_monitor,
         }
     }
@@ -241,74 +245,92 @@ impl Processor {
         use crate::tmux::TmuxEvent;
         match tmux_event {
             TmuxEvent::PaneReady { pane_id: _, window_id, title } => {
-                // Get the next TmuxPty from the session.
-                if let Some(ref session) = self.tmux_session {
-                    if let Some((pty, _title)) = session.try_recv_pty() {
-                        // Create a window for this pane.
-                        if self.gl_config.is_none() {
-                            // First window — initialize GL.
-                            let proxy = self.proxy.clone();
-                            let mut options = WindowOptions::default();
-                            options.window_identity.title = Some(title.clone());
+                // Try to get a TmuxPty from whichever tmux mode is active.
+                let pty = self
+                    .tmux_session
+                    .as_ref()
+                    .and_then(|s| s.try_recv_pty())
+                    .or_else(|| {
+                        self.inband_tmux.as_ref().and_then(|s| s.try_recv_pty())
+                    });
 
-                            match WindowContext::initial_with_tmux_pty(
-                                event_loop,
-                                proxy,
-                                self.config.clone(),
-                                options,
-                                pty,
-                            ) {
-                                Ok(window_context) => {
-                                    self.gl_config =
-                                        Some(window_context.display.gl_context().config());
-                                    let wid = window_context.id();
-                                    self.windows.insert(wid, window_context);
-                                    if let Some(ref mut session) = self.tmux_session {
-                                        session.register_window(window_id, wid);
-                                    }
-                                },
-                                Err(err) => {
-                                    error!("Failed to create initial tmux window: {err}");
-                                },
-                            }
-                        } else {
-                            match self.create_tmux_window(event_loop, pty, title.clone()) {
-                                Ok(()) => {
-                                    // Find the window we just created and register it.
-                                    if let Some((&wid, _)) = self.windows.iter().last() {
-                                        if let Some(ref mut session) = self.tmux_session {
-                                            session.register_window(window_id, wid);
-                                        }
-                                    }
-                                },
-                                Err(err) => {
-                                    error!("Failed to create tmux window: {err}");
-                                },
-                            }
+                if let Some((pty, _title)) = pty {
+                    if self.gl_config.is_none() {
+                        let proxy = self.proxy.clone();
+                        let mut options = WindowOptions::default();
+                        options.window_identity.title = Some(title.clone());
+
+                        match WindowContext::initial_with_tmux_pty(
+                            event_loop,
+                            proxy,
+                            self.config.clone(),
+                            options,
+                            pty,
+                        ) {
+                            Ok(window_context) => {
+                                self.gl_config =
+                                    Some(window_context.display.gl_context().config());
+                                let wid = window_context.id();
+                                self.windows.insert(wid, window_context);
+                                self.register_tmux_window(window_id, wid);
+                            },
+                            Err(err) => {
+                                error!("Failed to create initial tmux window: {err}");
+                            },
+                        }
+                    } else {
+                        match self.create_tmux_window(event_loop, pty, title.clone()) {
+                            Ok(()) => {
+                                if let Some((&wid, _)) = self.windows.iter().last() {
+                                    self.register_tmux_window(window_id, wid);
+                                }
+                            },
+                            Err(err) => {
+                                error!("Failed to create tmux window: {err}");
+                            },
                         }
                     }
                 }
             },
             TmuxEvent::WindowClosed { window_id } => {
-                if let Some(ref session) = self.tmux_session {
-                    if let Some(alacritty_wid) = session.get_alacritty_window(&window_id) {
-                        if let Entry::Occupied(entry) = self.windows.entry(alacritty_wid) {
-                            let wc = entry.remove();
-                            self.scheduler.unschedule_window(wc.id());
-                        }
+                let alacritty_wid = self
+                    .tmux_session
+                    .as_ref()
+                    .and_then(|s| s.get_alacritty_window(&window_id))
+                    .or_else(|| {
+                        self.inband_tmux.as_ref().and_then(|s| s.get_alacritty_window(&window_id))
+                    });
+
+                if let Some(wid) = alacritty_wid {
+                    if let Entry::Occupied(entry) = self.windows.entry(wid) {
+                        let wc = entry.remove();
+                        self.scheduler.unschedule_window(wc.id());
                     }
                 }
 
-                if self.windows.is_empty() {
+                // Only count visible windows (exclude hidden source window).
+                let visible_windows = self.windows.len();
+                if visible_windows == 0
+                    || (visible_windows == 1
+                        && self.inband_tmux.as_ref().map_or(false, |s| {
+                            self.windows.contains_key(&s.source_window_id)
+                        }))
+                {
                     event_loop.exit();
                 }
             },
             TmuxEvent::WindowRenamed { window_id, name } => {
-                if let Some(ref session) = self.tmux_session {
-                    if let Some(alacritty_wid) = session.get_alacritty_window(&window_id) {
-                        if let Some(wc) = self.windows.get_mut(&alacritty_wid) {
-                            wc.display.window.set_title(name);
-                        }
+                let alacritty_wid = self
+                    .tmux_session
+                    .as_ref()
+                    .and_then(|s| s.get_alacritty_window(&window_id))
+                    .or_else(|| {
+                        self.inband_tmux.as_ref().and_then(|s| s.get_alacritty_window(&window_id))
+                    });
+
+                if let Some(wid) = alacritty_wid {
+                    if let Some(wc) = self.windows.get_mut(&wid) {
+                        wc.display.window.set_title(name);
                     }
                 }
             },
@@ -316,6 +338,16 @@ impl Processor {
                 info!("tmux session exited, closing all windows");
                 event_loop.exit();
             },
+        }
+    }
+
+    /// Register a tmux window mapping in whichever tmux mode is active.
+    #[cfg(unix)]
+    fn register_tmux_window(&mut self, tmux_window_id: String, alacritty_wid: WindowId) {
+        if let Some(ref mut session) = self.tmux_session {
+            session.register_window(tmux_window_id, alacritty_wid);
+        } else if let Some(ref mut state) = self.inband_tmux {
+            state.register_window(tmux_window_id, alacritty_wid);
         }
     }
 
@@ -330,6 +362,60 @@ impl Processor {
             Err(err) => {
                 error!("Failed to start tmux session: {err}");
             },
+        }
+    }
+
+    /// Handle a tmux control mode notification line received in-band.
+    #[cfg(unix)]
+    fn handle_inband_tmux_line(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_window_id: WindowId,
+        line: &str,
+    ) {
+        // Lazily create the in-band state on first notification.
+        if self.inband_tmux.is_none() {
+            info!("Initializing in-band tmux control mode from window {source_window_id:?}");
+            self.inband_tmux =
+                Some(crate::tmux_inband::InBandTmuxState::new(source_window_id, self.proxy.clone()));
+        }
+
+        // Get the notifier for the source window (which is connected to the
+        // tmux process). We need it to send commands back to tmux.
+        // Clone the inner EventLoopSender so we don't hold a borrow on self.windows.
+        let loop_sender = match self.windows.get(&source_window_id) {
+            Some(wc) => wc.notifier().0.clone(),
+            None => return,
+        };
+        let notifier = Notifier(loop_sender);
+
+        if let Some(ref mut state) = self.inband_tmux {
+            state.process_line(line, &notifier);
+        }
+
+        // Collect ready PTYs outside the mutable borrow of inband_tmux.
+        let mut ready_ptys = Vec::new();
+        if let Some(ref state) = self.inband_tmux {
+            while let Some(pty_and_title) = state.try_recv_pty() {
+                ready_ptys.push(pty_and_title);
+            }
+        }
+
+        for (pty, title) in ready_ptys {
+            // Hide the source window (it's now just a tmux control channel).
+            if let Some(source_wc) = self.windows.get(&source_window_id) {
+                source_wc.display.window.set_visible(false);
+            }
+
+            if self.gl_config.is_none() {
+                error!("GL config not available for tmux pane window");
+                continue;
+            }
+
+            if let Err(err) = self.create_tmux_window(event_loop, pty, title) {
+                error!("Failed to create in-band tmux window: {err}");
+            }
+            // Window registration happens via TmuxEvent::PaneReady.
         }
     }
 
@@ -598,6 +684,14 @@ impl ApplicationHandler<Event> for Processor {
 
                     event_loop.exit();
                 }
+            },
+            // Handle in-band tmux control mode notification.
+            #[cfg(unix)]
+            (
+                EventType::Terminal(TerminalEvent::TmuxCCNotification(line)),
+                Some(window_id),
+            ) => {
+                self.handle_inband_tmux_line(event_loop, *window_id, &line);
             },
             // NOTE: This event bypasses batching to minimize input latency.
             (EventType::Frame, Some(window_id)) => {
@@ -2090,6 +2184,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::MouseCursorDirty => self.reset_mouse_cursor(),
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),
+                    #[cfg(unix)]
+                    TerminalEvent::TmuxCCNotification(_) => (),
                 },
                 #[cfg(unix)]
                 EventType::IpcConfig(_) | EventType::IpcGetConfig(..) | EventType::Shutdown => (),

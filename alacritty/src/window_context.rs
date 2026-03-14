@@ -643,6 +643,14 @@ impl WindowContext {
         self.display.window.id()
     }
 
+    /// Get a reference to the PTY notifier.
+    ///
+    /// Used by the in-band tmux controller to send commands to the tmux
+    /// process through the source window's PTY.
+    pub fn notifier(&self) -> &Notifier {
+        &self.notifier
+    }
+
     /// Write the ref test results to the disk.
     pub fn write_ref_test_results(&self) {
         // Dump grid state.

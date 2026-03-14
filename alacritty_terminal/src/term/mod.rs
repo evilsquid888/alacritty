@@ -810,6 +810,7 @@ impl<T> Term<T> {
         self.event_proxy.send_event(Event::Exit);
     }
 
+
     /// Toggle the vi mode.
     #[inline]
     pub fn toggle_vi_mode(&mut self)
@@ -2269,6 +2270,7 @@ impl<T: EventListener> Handler for Term<T> {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
+
 }
 
 /// The state of the [`Mode`] and [`PrivateMode`].

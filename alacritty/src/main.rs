@@ -48,6 +48,8 @@ mod scheduler;
 mod string;
 #[cfg(unix)]
 mod tmux;
+#[cfg(unix)]
+mod tmux_inband;
 mod window_context;
 
 mod gl {

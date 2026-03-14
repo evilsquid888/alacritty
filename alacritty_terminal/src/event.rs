@@ -56,6 +56,13 @@ pub enum Event {
 
     /// Child process exited.
     ChildExit(ExitStatus),
+
+    /// tmux control mode was detected in-band (DCS `\033P1000p`).
+    ///
+    /// The PTY event loop has switched to tmux protocol parsing mode.
+    /// The attached data is a tmux control mode notification line.
+    #[cfg(unix)]
+    TmuxCCNotification(String),
 }
 
 impl Debug for Event {
@@ -74,6 +81,8 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
+            #[cfg(unix)]
+            Event::TmuxCCNotification(line) => write!(f, "TmuxCCNotification({line})"),
         }
     }
 }

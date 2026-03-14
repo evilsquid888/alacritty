@@ -113,6 +113,30 @@ where
         let mut unprocessed = 0;
         let mut processed = 0;
 
+        // In tmux control mode we skip the VTE parser entirely — no terminal
+        // lease or lock needed.
+        #[cfg(unix)]
+        if state.tmux_cc_mode {
+            loop {
+                match self.pty.reader().read(&mut buf[unprocessed..]) {
+                    Ok(0) if unprocessed == 0 => break,
+                    Ok(got) => unprocessed += got,
+                    Err(err) => match err.kind() {
+                        ErrorKind::Interrupted | ErrorKind::WouldBlock => {
+                            if unprocessed == 0 {
+                                break;
+                            }
+                        },
+                        _ => return Err(err),
+                    },
+                }
+
+                self.pty_read_tmux(state, &buf[..unprocessed]);
+                unprocessed = 0;
+            }
+            return Ok(());
+        }
+
         // Reserve the next terminal lock for PTY reading.
         let _terminal_lease = Some(self.terminal.lease());
         let mut terminal = None;
@@ -132,6 +156,27 @@ where
                     },
                     _ => return Err(err),
                 },
+            }
+
+            // Scan for tmux control mode DCS before feeding to the VTE parser.
+            // tmux sends \x1bP1000p to initiate control mode.
+            #[cfg(unix)]
+            if let Some(pos) = find_tmux_dcs(&buf[..unprocessed]) {
+                log::info!("Switching to tmux control mode (in-band DCS detected)");
+                state.tmux_cc_mode = true;
+
+                // Skip the DCS header and process remaining as tmux protocol.
+                let after_dcs = skip_past_dcs_header(&buf[pos..unprocessed]);
+                let remaining_start = pos + after_dcs;
+
+                // Drop the terminal lock before entering tmux mode.
+                drop(terminal);
+                drop(_terminal_lease);
+
+                if remaining_start < unprocessed {
+                    self.pty_read_tmux(state, &buf[remaining_start..unprocessed]);
+                }
+                return Ok(());
             }
 
             // Attempt to lock the terminal.
@@ -168,6 +213,27 @@ where
         }
 
         Ok(())
+    }
+
+    /// Process PTY output as tmux control mode protocol lines.
+    ///
+    /// Buffers bytes until a complete line (`\n`-terminated) is available,
+    /// then emits it as a [`Event::TmuxCCNotification`].
+    #[cfg(unix)]
+    fn pty_read_tmux(&mut self, state: &mut State, data: &[u8]) {
+        for &byte in data {
+            if byte == b'\n' {
+                // Complete line ready.
+                if let Ok(line) = String::from_utf8(std::mem::take(&mut state.tmux_line_buf)) {
+                    let trimmed = line.trim_end_matches('\r').to_string();
+                    self.event_proxy.send_event(Event::TmuxCCNotification(trimmed));
+                } else {
+                    state.tmux_line_buf.clear();
+                }
+            } else {
+                state.tmux_line_buf.push(byte);
+            }
+        }
     }
 
     #[inline]
@@ -402,6 +468,13 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    /// When `true`, the PTY output is parsed as the tmux control mode text
+    /// protocol instead of being fed to the VTE escape-sequence parser.
+    #[cfg(unix)]
+    tmux_cc_mode: bool,
+    /// Incomplete line buffer for tmux control mode parsing.
+    #[cfg(unix)]
+    tmux_line_buf: Vec<u8>,
 }
 
 impl State {
@@ -483,4 +556,32 @@ impl<T> PeekableReceiver<T> {
             }
         }
     }
+}
+
+/// Search a byte buffer for the tmux control mode DCS header.
+///
+/// tmux sends `\x1bP1000p` to initiate control mode. Returns the byte
+/// offset of the ESC if found.
+#[cfg(unix)]
+fn find_tmux_dcs(buf: &[u8]) -> Option<usize> {
+    // Match ESC P 1000 p  →  \x1b P 1 0 0 0 p
+    const PATTERN: &[u8] = b"\x1bP1000p";
+    buf.windows(PATTERN.len()).position(|w| w == PATTERN)
+}
+
+/// Skip past the DCS header and any trailing newline.
+///
+/// Returns the number of bytes to skip from the start of `buf`
+/// (which should begin at the ESC of the DCS).
+#[cfg(unix)]
+fn skip_past_dcs_header(buf: &[u8]) -> usize {
+    const HEADER_LEN: usize = b"\x1bP1000p".len(); // 7 bytes
+    let mut pos = HEADER_LEN;
+
+    // Skip optional trailing newline(s) after the DCS header.
+    while pos < buf.len() && (buf[pos] == b'\n' || buf[pos] == b'\r') {
+        pos += 1;
+    }
+
+    pos
 }
