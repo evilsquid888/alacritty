@@ -96,36 +96,42 @@ impl InBandTmuxState {
     /// `notifier` is the Notifier for the source window's PTY — used to
     /// send commands to the tmux process.
     pub fn process_line(&mut self, line: &str, notifier: &Notifier) {
+        // When inside a %begin/%end response block, lines are raw data
+        // (e.g. pane IDs like "%3" that start with '%'). Handle them
+        // before calling parse_line to avoid misclassification.
+        if self.in_response {
+            if line.starts_with("%end") {
+                self.in_response = false;
+                if !self.handshake_done {
+                    self.handshake_done = true;
+                    info!("tmux in-band handshake complete");
+                    self.send_command(notifier, "list-panes -s -F '#{pane_id} #{window_id} #{pane_active} #{pane_width} #{pane_height} #{window_name}'");
+                    self.initial_query_sent = true;
+                } else if self.initial_query_sent {
+                    self.process_pane_list_response();
+                    self.initial_query_sent = false;
+                }
+                // Drain inputs after processing response.
+                self.drain_pane_inputs(notifier);
+                return;
+            } else if line.starts_with("%error") {
+                self.in_response = false;
+                if !self.handshake_done {
+                    error!("tmux returned error during handshake");
+                }
+                return;
+            }
+            // Raw response data line.
+            self.response_lines.push(line.to_string());
+            return;
+        }
+
         let notification = protocol::parse_line(line);
 
         match notification {
             Notification::Begin { .. } => {
                 self.in_response = true;
                 self.response_lines.clear();
-            },
-            Notification::End { .. } => {
-                self.in_response = false;
-                if !self.handshake_done {
-                    self.handshake_done = true;
-                    info!("tmux in-band handshake complete");
-
-                    // Query existing panes.
-                    self.send_command(notifier, "list-panes -s -F '#{pane_id} #{window_id} #{pane_active} #{pane_width} #{pane_height} #{window_name}'");
-                    self.initial_query_sent = true;
-                } else if self.initial_query_sent {
-                    // Process the response as pane info.
-                    self.process_pane_list_response();
-                    self.initial_query_sent = false;
-                }
-            },
-            Notification::Error { .. } => {
-                self.in_response = false;
-                if !self.handshake_done {
-                    error!("tmux returned error during handshake");
-                }
-            },
-            Notification::ResponseLine(ref data) if self.in_response => {
-                self.response_lines.push(data.clone());
             },
 
             Notification::Output { ref pane_id, ref data } => {

@@ -6,10 +6,14 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::num::NonZeroUsize;
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
 
 use log::{debug, error, info, warn};
+use polling::{Event as PollEvent, Events, Poller};
 use winit::event_loop::EventLoopProxy;
 use winit::window::WindowId;
 
@@ -173,157 +177,44 @@ fn run_controller(
 
     // Enter the main I/O loop.
     //
-    // We use a polling-based loop to multiplex:
-    //   1. Reading lines from tmux stdout (for control protocol notifications).
+    // We use polling to multiplex:
+    //   1. Reading lines from tmux stdout (control protocol notifications).
     //   2. Reading user input from each pane's controller_end fd.
     //   3. Receiving TmuxPtyCmd messages (resize events).
     //
-    // For simplicity, we use a blocking line-read approach for tmux stdout
-    // and check pane inputs between lines.
-    let mut line = String::new();
-    let mut cmd_counter: u64 = 1;
+    // The master fd must be set to non-blocking for polling to work.
+    let master_raw_fd = reader.get_ref().as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(master_raw_fd, libc::F_GETFL);
+        libc::fcntl(master_raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    let poller = Poller::new()?;
+    const TMUX_TOKEN: usize = 0;
+    unsafe { poller.add(reader.get_ref(), PollEvent::readable(TMUX_TOKEN))?; }
+
+    // Register each pane handle for readable events (user input).
+    for (i, (_pane_id, handle)) in pane_handles.iter().enumerate() {
+        unsafe { poller.add(&handle.file, PollEvent::readable(100 + i))?; }
+    }
+
+    let mut events = Events::with_capacity(NonZeroUsize::new(64).unwrap());
+    let mut line_buf = Vec::<u8>::new();
+    let mut read_buf = [0u8; 8192];
     let mut in_response = false;
-    let mut response_lines: Vec<String> = Vec::new();
 
-    loop {
-        line.clear();
-
-        // Read one line from tmux. This blocks until data is available.
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                info!("tmux stdout closed");
-                break;
-            },
-            Ok(_) => {},
-            Err(err) => {
-                error!("Error reading from tmux: {err}");
-                break;
-            },
+    'main: loop {
+        events.clear();
+        if let Err(err) = poller.wait(&mut events, Some(Duration::from_millis(50))) {
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            error!("Poller error: {err}");
+            break;
         }
 
-        // Strip \r\n from PTY output.
-        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
-        debug!("tmux: {trimmed}");
-
-        let notification = protocol::parse_line(trimmed);
-
-        match notification {
-            Notification::Output { ref pane_id, ref data } => {
-                if let Some(handle) = pane_handles.get_mut(pane_id) {
-                    // Write decoded output to the controller end of the socketpair.
-                    // The PTY event loop will read it from the other end.
-                    let mut written = 0;
-                    while written < data.len() {
-                        match handle.file.write(&data[written..]) {
-                            Ok(0) => break,
-                            Ok(n) => written += n,
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // Socket buffer full — spin briefly.
-                                std::thread::yield_now();
-                            },
-                            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(err) => {
-                                warn!("Error writing output to pane {pane_id}: {err}");
-                                break;
-                            },
-                        }
-                    }
-                }
-            },
-
-            Notification::WindowAdd { ref window_id } => {
-                info!("tmux window added: {window_id}");
-                // Query panes for this new window.
-                let new_panes =
-                    query_window_panes(&mut reader, &mut tmux_stdin, window_id, &mut cmd_counter)?;
-
-                for pane in &new_panes {
-                    if pane_handles.contains_key(&pane.pane_id) {
-                        continue;
-                    }
-
-                    let (pty, handle) = create_pane_pair(
-                        pane.pane_id.clone(),
-                        pane.window_id.clone(),
-                        cmd_tx.clone(),
-                    )?;
-
-                    pane_to_window.insert(pane.pane_id.clone(), pane.window_id.clone());
-                    pane_handles.insert(pane.pane_id.clone(), handle);
-
-                    let _ = pty_tx.send((pty, pane.window_name.clone()));
-                    let _ = event_proxy.send_event(Event::new(
-                        EventType::TmuxEvent(TmuxEvent::PaneReady {
-                            pane_id: pane.pane_id.clone(),
-                            window_id: pane.window_id.clone(),
-                            title: pane.window_name.clone(),
-                        }),
-                        None,
-                    ));
-                }
-            },
-
-            Notification::WindowClose { ref window_id } => {
-                info!("tmux window closed: {window_id}");
-                // Signal exit for all panes in this window.
-                let panes_to_remove: Vec<String> = pane_to_window
-                    .iter()
-                    .filter(|(_, wid)| *wid == window_id)
-                    .map(|(pid, _)| pid.clone())
-                    .collect();
-
-                for pane_id in &panes_to_remove {
-                    if let Some(mut handle) = pane_handles.remove(pane_id) {
-                        let _ = handle.exit_signal.write(&[1]);
-                    }
-                    pane_to_window.remove(pane_id);
-                }
-
-                let _ = event_proxy.send_event(Event::new(
-                    EventType::TmuxEvent(TmuxEvent::WindowClosed {
-                        window_id: window_id.clone(),
-                    }),
-                    None,
-                ));
-            },
-
-            Notification::WindowRenamed { ref window_id, ref name } => {
-                let _ = event_proxy.send_event(Event::new(
-                    EventType::TmuxEvent(TmuxEvent::WindowRenamed {
-                        window_id: window_id.clone(),
-                        name: name.clone(),
-                    }),
-                    None,
-                ));
-            },
-
-            Notification::Exit { .. } => {
-                info!("tmux session exited");
-                let _ = event_proxy.send_event(Event::new(
-                    EventType::TmuxEvent(TmuxEvent::SessionExit),
-                    None,
-                ));
-                break;
-            },
-
-            Notification::Begin { .. } => {
-                in_response = true;
-                response_lines.clear();
-            },
-            Notification::End { .. } | Notification::Error { .. } => {
-                in_response = false;
-            },
-            Notification::ResponseLine(ref _line) if in_response => {
-                // Ignore unsolicited response lines.
-            },
-
-            _ => {},
-        }
-
-        // Check for user input on all pane handles (non-blocking).
+        // Always drain pane inputs and resize commands, even on timeout.
         drain_pane_inputs(&mut pane_handles, &mut tmux_stdin);
-
-        // Check for resize commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 TmuxPtyCmd::Resize { ref pane_id, size } => {
@@ -338,6 +229,52 @@ fn run_controller(
                 },
             }
         }
+
+        // Read available data from tmux master fd.
+        loop {
+            match reader.read(&mut read_buf) {
+                Ok(0) => {
+                    info!("tmux stdout closed");
+                    break 'main;
+                },
+                Ok(n) => {
+                    // Extract complete lines from the data.
+                    for &byte in &read_buf[..n] {
+                        if byte == b'\n' {
+                            let line_str = String::from_utf8_lossy(&line_buf).to_string();
+                            let trimmed = line_str.trim_end_matches('\r');
+
+                            if !trimmed.is_empty() {
+                                if !process_tmux_line(
+                                    trimmed,
+                                    &mut in_response,
+                                    &mut pane_handles,
+                                    &mut pane_to_window,
+                                    &mut tmux_stdin,
+                                    &cmd_tx,
+                                    &pty_tx,
+                                    &event_proxy,
+                                ) {
+                                    break 'main;
+                                }
+                            }
+                            line_buf.clear();
+                        } else {
+                            line_buf.push(byte);
+                        }
+                    }
+                },
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    error!("Error reading from tmux: {err}");
+                    break 'main;
+                },
+            }
+        }
+
+        // Re-register the master fd for next poll cycle.
+        poller.modify(reader.get_ref(), PollEvent::readable(TMUX_TOKEN))?;
     }
 
     // Signal all remaining panes to exit.
@@ -441,6 +378,9 @@ fn query_panes(
 
     // Read response between %begin and %end.
     // Notifications like %window-add may arrive before the response.
+    // IMPORTANT: Lines between %begin and %end are raw response data —
+    // they must NOT be fed to parse_line() because pane IDs like %3
+    // start with '%' and would be misclassified as notifications.
     let mut panes = Vec::new();
     let mut in_response = false;
     let mut line = String::new();
@@ -451,33 +391,30 @@ fn query_panes(
             break;
         }
 
-        debug!("query_panes line: {line:?}");
-        match protocol::parse_line(&line) {
-            Notification::Begin { .. } => {
-                in_response = true;
-            },
-            Notification::End { .. } => break,
-            Notification::Error { .. } => {
+        if in_response {
+            // Check for %end / %error to close the response block.
+            if line.starts_with("%end") {
+                break;
+            } else if line.starts_with("%error") {
                 warn!("Error querying panes");
                 break;
-            },
-            Notification::ResponseLine(ref data) if in_response => {
-                let data = data.trim_matches('\'');
-                if let Some(pane) = protocol::parse_pane_info(data) {
-                    panes.push(pane);
-                }
-            },
-            _ => {
-                // Skip notifications (%window-add, %session-changed, etc.)
-                debug!("Skipping notification during pane query: {line}");
-            },
+            }
+            // Raw response data — parse as pane info.
+            let data = line.trim_matches('\'');
+            if let Some(pane) = protocol::parse_pane_info(data) {
+                panes.push(pane);
+            }
+        } else if line.starts_with("%begin") {
+            in_response = true;
         }
+        // Skip any notifications before %begin.
     }
 
     Ok(panes)
 }
 
 /// Query panes for a specific window.
+#[allow(dead_code)]
 fn query_window_panes(
     reader: &mut BufReader<impl Read>,
     stdin: &mut impl Write,
@@ -501,26 +438,133 @@ fn query_window_panes(
             break;
         }
 
-        match protocol::parse_line(&line) {
-            Notification::Begin { .. } => {
-                in_response = true;
-            },
-            Notification::End { .. } => break,
-            Notification::Error { .. } => {
+        if in_response {
+            if line.starts_with("%end") {
+                break;
+            } else if line.starts_with("%error") {
                 warn!("Error querying panes for window {window_id}");
                 break;
-            },
-            Notification::ResponseLine(ref data) if in_response => {
-                let data = data.trim_matches('\'');
-                if let Some(pane) = protocol::parse_pane_info(data) {
-                    panes.push(pane);
-                }
-            },
-            _ => {},
+            }
+            let data = line.trim_matches('\'');
+            if let Some(pane) = protocol::parse_pane_info(data) {
+                panes.push(pane);
+            }
+        } else if line.starts_with("%begin") {
+            in_response = true;
         }
     }
 
     Ok(panes)
+}
+
+/// Process a single tmux control protocol line.
+///
+/// Returns `false` if the session has exited (caller should break).
+#[allow(clippy::too_many_arguments)]
+fn process_tmux_line(
+    line: &str,
+    in_response: &mut bool,
+    pane_handles: &mut HashMap<String, PaneHandle>,
+    pane_to_window: &mut HashMap<String, String>,
+    tmux_stdin: &mut impl Write,
+    _cmd_tx: &Sender<TmuxPtyCmd>,
+    _pty_tx: &Sender<(TmuxPty, String)>,
+    event_proxy: &EventLoopProxy<Event>,
+) -> bool {
+    // Handle response blocks (raw data between %begin/%end).
+    if *in_response {
+        if line.starts_with("%end") || line.starts_with("%error") {
+            *in_response = false;
+        }
+        // Ignore response data in the main loop (queries handle their own).
+        return true;
+    }
+
+    let notification = protocol::parse_line(line);
+
+    match notification {
+        Notification::Output { ref pane_id, ref data } => {
+            if let Some(handle) = pane_handles.get_mut(pane_id) {
+                let mut written = 0;
+                while written < data.len() {
+                    match handle.file.write(&data[written..]) {
+                        Ok(0) => break,
+                        Ok(n) => written += n,
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::yield_now();
+                        },
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) => {
+                            warn!("Error writing output to pane {pane_id}: {err}");
+                            break;
+                        },
+                    }
+                }
+            }
+        },
+
+        Notification::WindowAdd { ref window_id } => {
+            info!("tmux window added: {window_id}");
+            // For new windows we need to query panes, but we can't do a
+            // synchronous query here (we're non-blocking). Send the command
+            // and the response will be parsed in the next poll cycle.
+            let cmd = format!(
+                "list-panes -t {window_id} -F '#{{pane_id}} #{{window_id}} #{{pane_active}} #{{pane_width}} #{{pane_height}} #{{window_name}}'\n"
+            );
+            let _ = tmux_stdin.write_all(cmd.as_bytes());
+            let _ = tmux_stdin.flush();
+        },
+
+        Notification::WindowClose { ref window_id } => {
+            info!("tmux window closed: {window_id}");
+            let panes_to_remove: Vec<String> = pane_to_window
+                .iter()
+                .filter(|(_, wid)| *wid == window_id)
+                .map(|(pid, _)| pid.clone())
+                .collect();
+
+            for pane_id in &panes_to_remove {
+                if let Some(mut handle) = pane_handles.remove(pane_id) {
+                    let _ = handle.exit_signal.write(&[1]);
+                }
+                pane_to_window.remove(pane_id);
+            }
+
+            let _ = event_proxy.send_event(Event::new(
+                EventType::TmuxEvent(TmuxEvent::WindowClosed {
+                    window_id: window_id.clone(),
+                }),
+                None,
+            ));
+        },
+
+        Notification::WindowRenamed { ref window_id, ref name } => {
+            let _ = event_proxy.send_event(Event::new(
+                EventType::TmuxEvent(TmuxEvent::WindowRenamed {
+                    window_id: window_id.clone(),
+                    name: name.clone(),
+                }),
+                None,
+            ));
+        },
+
+        Notification::Exit { .. } => {
+            info!("tmux session exited");
+            let _ = event_proxy.send_event(Event::new(
+                EventType::TmuxEvent(TmuxEvent::SessionExit),
+                None,
+            ));
+            return false;
+        },
+
+        Notification::Begin { .. } => {
+            *in_response = true;
+        },
+
+        _ => {},
+    }
+
+    true
 }
 
 /// Non-blocking read of user input from all pane handles, forwarding to tmux stdin.
