@@ -57,6 +57,7 @@ dependencies = [
  "parking_lot",
  "png",
  "polling",
+ "rustix-openpty",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -136,11 +136,8 @@ fn run_controller(
     let mut tmux_stdin = master_write;
     let mut reader = BufReader::new(master_file);
 
-    // Skip the initial DCS escape if present.
-    skip_dcs_header(&mut reader)?;
-
-    // Wait for the initial %begin/%end handshake.
-    wait_initial_handshake(&mut reader)?;
+    // Skip the DCS header and wait for the initial %begin/%end handshake.
+    skip_dcs_and_handshake(&mut reader)?;
 
     // Query existing panes.
     info!("Querying existing tmux panes...");
@@ -204,7 +201,8 @@ fn run_controller(
             },
         }
 
-        let trimmed = line.trim_end_matches('\n');
+        // Strip \r\n from PTY output.
+        let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
         debug!("tmux: {trimmed}");
 
         let notification = protocol::parse_line(trimmed);
@@ -358,47 +356,65 @@ fn run_controller(
     Ok(())
 }
 
-/// Skip the DCS escape sequence at the start of tmux control mode.
+/// Read one trimmed line from the tmux control protocol.
 ///
-/// tmux sends `\x1bP1000p` (or similar) as a protocol header.
-fn skip_dcs_header(reader: &mut BufReader<impl Read>) -> io::Result<()> {
-    // Peek at the first byte.
-    let buf = reader.fill_buf()?;
-    if buf.is_empty() {
-        return Ok(());
+/// PTY lines end with `\r\n`; this strips both.
+fn read_tmux_line(reader: &mut BufReader<impl Read>, buf: &mut String) -> io::Result<usize> {
+    buf.clear();
+    let n = reader.read_line(buf)?;
+    // Strip trailing \r\n or \n.
+    while buf.ends_with('\n') || buf.ends_with('\r') {
+        buf.pop();
     }
+    Ok(n)
+}
 
-    // If it starts with ESC (0x1b), read until 'p' (end of DCS).
-    if buf[0] == 0x1b {
-        let mut byte = [0u8; 1];
+/// Skip the DCS escape and wait for the initial `%begin`/`%end` handshake.
+///
+/// tmux sends `\x1bP1000p%begin <ts> <n> <f>\r\n%end <ts> <n> <f>\r\n`
+/// The DCS header (`\x1bP1000p`) is NOT newline-terminated — it runs
+/// directly into `%begin` on the same line.
+fn skip_dcs_and_handshake(reader: &mut BufReader<impl Read>) -> io::Result<()> {
+    let mut line = String::new();
+
+    // First line contains the DCS header + %begin.
+    read_tmux_line(reader, &mut line)?;
+    debug!("tmux initial line: {line:?}");
+
+    // Strip the DCS prefix if present.
+    if let Some(_pos) = line.find("%begin") {
+        // Good — we found %begin.
+        debug!("tmux handshake: found %begin");
+    } else {
+        // No %begin on first line — keep reading until we find it.
         loop {
-            reader.read_exact(&mut byte)?;
-            if byte[0] == b'p' {
+            read_tmux_line(reader, &mut line)?;
+            if line.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "tmux closed during handshake",
+                ));
+            }
+            if line.contains("%begin") {
                 break;
             }
         }
-        // Consume the newline after the DCS.
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
     }
 
-    Ok(())
-}
-
-/// Wait for the initial `%begin`/`%end` handshake.
-fn wait_initial_handshake(reader: &mut BufReader<impl Read>) -> io::Result<()> {
-    let mut line = String::new();
+    // Now wait for %end.
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tmux closed during handshake"));
+        read_tmux_line(reader, &mut line)?;
+        if line.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tmux closed during handshake",
+            ));
         }
-
-        let trimmed = line.trim();
-        match protocol::parse_line(trimmed) {
+        debug!("tmux handshake line: {line:?}");
+        let notification = protocol::parse_line(&line);
+        match notification {
             Notification::End { .. } => {
-                debug!("tmux handshake complete");
+                info!("tmux handshake complete");
                 return Ok(());
             },
             Notification::Error { .. } => {
@@ -424,19 +440,19 @@ fn query_panes(
     stdin.flush()?;
 
     // Read response between %begin and %end.
+    // Notifications like %window-add may arrive before the response.
     let mut panes = Vec::new();
     let mut in_response = false;
     let mut line = String::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
+        read_tmux_line(reader, &mut line)?;
+        if line.is_empty() {
             break;
         }
 
-        let trimmed = line.trim();
-        match protocol::parse_line(trimmed) {
+        debug!("query_panes line: {line:?}");
+        match protocol::parse_line(&line) {
             Notification::Begin { .. } => {
                 in_response = true;
             },
@@ -446,13 +462,15 @@ fn query_panes(
                 break;
             },
             Notification::ResponseLine(ref data) if in_response => {
-                // Remove surrounding quotes from -F format.
                 let data = data.trim_matches('\'');
                 if let Some(pane) = protocol::parse_pane_info(data) {
                     panes.push(pane);
                 }
             },
-            _ => {},
+            _ => {
+                // Skip notifications (%window-add, %session-changed, etc.)
+                debug!("Skipping notification during pane query: {line}");
+            },
         }
     }
 
@@ -478,14 +496,12 @@ fn query_window_panes(
     let mut line = String::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
+        read_tmux_line(reader, &mut line)?;
+        if line.is_empty() {
             break;
         }
 
-        let trimmed = line.trim();
-        match protocol::parse_line(trimmed) {
+        match protocol::parse_line(&line) {
             Notification::Begin { .. } => {
                 in_response = true;
             },
@@ -499,11 +515,6 @@ fn query_window_panes(
                 if let Some(pane) = protocol::parse_pane_info(data) {
                     panes.push(pane);
                 }
-            },
-            // Handle any output notifications that arrive between our command.
-            Notification::Output { .. } => {
-                // These will be picked up by the main loop later.
-                // For now, we can't easily dispatch them without the pane handles.
             },
             _ => {},
         }
